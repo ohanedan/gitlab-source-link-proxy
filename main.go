@@ -13,6 +13,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/jamiealquiza/bicache"
@@ -91,6 +92,43 @@ func GetCachedTokenUser(c *bicache.Bicache, gitLabUserURL, accessToken string) (
 	return userResponse.Username, nil
 }
 
+// NB GitLab only accepts access tokens in the API endpoints; the raw file
+// endpoints require a session, and redirect to the sign-in page when there is
+// none. So we rewrite the raw file URLs into the equivalent API URLs, e.g.
+// /group/project/-/raw/REF/PATH becomes
+// /api/v4/projects/group%2Fproject/repository/files/PATH/raw?ref=REF
+// see https://docs.gitlab.com/api/repository_files/#get-raw-file-from-repository
+// NB REF must not contain a slash. Source Link always uses a commit hash, so
+// this is not a problem in practice.
+var rawURLRegexp = regexp.MustCompile("^/(.+?)/(?:-/)?raw/([^/]+)/(.+)$")
+
+// escapePathSegment is like url.PathEscape but also escapes the plus sign,
+// because some servers decode it as a space.
+func escapePathSegment(s string) string {
+	return strings.ReplaceAll(url.PathEscape(s), "+", "%2B")
+}
+
+// RewriteRawURL rewrites a GitLab raw file URL into the equivalent GitLab API
+// URL. It returns false when the URL is not a raw file URL.
+func RewriteRawURL(u *url.URL) bool {
+	m := rawURLRegexp.FindStringSubmatch(u.Path)
+	if m == nil {
+		return false
+	}
+	project, ref, filePath := m[1], m[2], m[3]
+	// NB the project and file paths must be url-encoded, including their
+	// slashes, so we must set both Path and RawPath.
+	u.Path = "/api/v4/projects/" + project + "/repository/files/" + filePath + "/raw"
+	u.RawPath = "/api/v4/projects/" + escapePathSegment(project) + "/repository/files/" + escapePathSegment(filePath) + "/raw"
+	q := u.Query()
+	q.Set("ref", ref)
+	// NB like the raw file endpoint, return the LFS file contents instead of
+	// the LFS pointer. This is ignored when the file is not tracked by LFS.
+	q.Set("lfs", "true")
+	u.RawQuery = q.Encode()
+	return true
+}
+
 // dumpRequest dumps the request headers with the credentials redacted.
 func dumpRequest(r *http.Request) string {
 	c := r.Clone(r.Context())
@@ -118,6 +156,7 @@ var (
 	baseGitLabURLFlag      = flag.String("gitlab-base-url", "", "GitLab Base URL (e.g. https://gitlab.example.com/)")
 	insecureSkipVerifyFlag = flag.Bool("tls-insecure-skip-verify", false, "Skip GitLab TLS verification")
 	validateTokenFlag      = flag.Bool("validate-token", true, "Validate the given access token before proxying the request")
+	rawURLRewriteFlag      = flag.Bool("raw-url-rewrite", true, "Rewrite the GitLab raw file URLs into the equivalent GitLab API URLs")
 )
 
 func main() {
@@ -180,6 +219,9 @@ func main() {
 			log.Printf("Authenticated as the %s user", tokenUsername)
 		}
 		r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+		if *rawURLRewriteFlag && RewriteRawURL(r.URL) {
+			log.Printf("Rewritten the raw file URL into the %s API URL", r.URL.RequestURI())
+		}
 		reverseProxy.ServeHTTP(w, r)
 	})
 	log.Fatal(http.ListenAndServe(*listenAddressFlag, nil))

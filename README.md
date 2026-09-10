@@ -15,9 +15,8 @@ and `device_code` grants. See the [GitLab OAuth 2.0 documentation](https://docs.
 
 Because of that, the Basic authentication **password must now be a GitLab
 access token**, for example a [personal access token](https://docs.gitlab.com/user/profile/personal_access_tokens/)
-with the `read_api` scope (add `read_repository` too when your GitLab requires
-it to read the repository files). The username is ignored, so you can use
-anything, e.g. `oauth2`.
+with the `read_api` scope (the `api` and `read_repository` scopes also work).
+The username is ignored, so you can use anything, e.g. `oauth2`.
 
 Each developer must create their own personal access token and enter it as the
 password when Git Credential Manager (or Visual Studio) asks for the GitLab
@@ -28,6 +27,29 @@ By default the proxy validates the given access token with the GitLab
 an hour), and replies with `401 Unauthorized` when the token is invalid, which
 makes the client ask for the credentials again. You can disable that with
 `--validate-token=false`.
+
+# Raw file URL rewriting
+
+GitLab only accepts access tokens in its API endpoints. Its raw file endpoints
+require a session, and redirect to the sign-in page when there is none (which
+is why you would get the sign-in page HTML instead of the file). So this proxy
+rewrites the raw file URLs into the equivalent [Repository Files API](https://docs.gitlab.com/api/repository_files/#get-raw-file-from-repository)
+URLs, e.g.:
+
+```
+/group/project/-/raw/REF/PATH
+```
+
+is proxied as:
+
+```
+/api/v4/projects/group%2Fproject/repository/files/PATH/raw?ref=REF&lfs=true
+```
+
+**NB `REF` must not contain a slash. Source Link always uses a commit hash, so
+this is not a problem in practice.**
+
+You can disable the rewriting with `--raw-url-rewrite=false`.
 
 You can see this used at [rgl/gitlab-vagrant](https://github.com/rgl/gitlab-vagrant).
 
