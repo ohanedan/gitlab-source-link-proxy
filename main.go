@@ -1,12 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
@@ -18,76 +19,92 @@ import (
 	"golang.org/x/crypto/blake2b"
 )
 
-type AccessTokenRequest struct {
-	GrantType string `json:"grant_type"`
-	Scope     string `json:"scope"` // NB GitLab 10.7.3 has this, but its not documented. See https://gitlab.com/gitlab-org/gitlab-ce/issues/45000
-	Username  string `json:"username"`
-	Password  string `json:"password"`
+const userAgent = "gitlab-source-link-proxy"
+
+// NB GitLab 19.0 removed the OAuth 2.0 Resource Owner Password Credentials
+//    flow (grant_type=password), so we can no longer exchange the basic
+//    authentication username and password for an access token. Instead, the
+//    basic authentication password must be a GitLab access token (e.g. a
+//    personal access token), which we forward as a Bearer token.
+//    See https://docs.gitlab.com/api/oauth2/
+
+var ErrInvalidToken = errors.New("invalid access token")
+
+type UserResponse struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
 }
 
-type AccessTokenResponse struct {
-	AccessToken string `json:"access_token"`
-	TokenType   string `json:"token_type"`
-	Scope       string `json:"scope"` // NB GitLab 10.7.3 has this, but its not documented. See https://gitlab.com/gitlab-org/gitlab-ce/issues/45000
-	//ExpiresInSeconds int32  `json:"expires_in"` // NB GitLab 10.7.3 does not have this. See https://gitlab.com/gitlab-org/gitlab-ce/issues/45000
-}
-
-// see https://docs.gitlab.com/ce/api/oauth2.html#resource-owner-password-credentials-flow
-func GetAccessToken(gitLabTokenURL, username, password string) (*AccessTokenResponse, error) {
-	requestJSON, err := json.Marshal(&AccessTokenRequest{
-		GrantType: "password",
-		Scope:     "read_repository",
-		Username:  username,
-		Password:  password,
-	})
+// GetTokenUser returns the GitLab user that owns the given access token.
+// see https://docs.gitlab.com/api/users/#list-current-user
+func GetTokenUser(gitLabUserURL, accessToken string) (*UserResponse, error) {
+	request, err := http.NewRequest(http.MethodGet, gitLabUserURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	response, err := http.Post(gitLabTokenURL, "application/json", bytes.NewBuffer(requestJSON))
+	request.Header.Set("User-Agent", userAgent)
+	request.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		return nil, err
 	}
-	dump, _ := httputil.DumpResponse(response, true)
-	log.Printf("AccessToken response %q", dump)
 	defer response.Body.Close()
-	responseBody, err := ioutil.ReadAll(response.Body)
+	// NB we never dump the response, as it might contain sensitive data.
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 64*1024))
 	if err != nil {
 		return nil, err
 	}
-	if response.StatusCode != 200 {
-		return nil, fmt.Errorf("invalid response %v", response)
+	switch response.StatusCode {
+	case http.StatusOK:
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return nil, ErrInvalidToken
+	default:
+		return nil, fmt.Errorf("invalid response status %s", response.Status)
 	}
 	// TODO check content-type.
-	var accessTokenResponse AccessTokenResponse
-	if err := json.Unmarshal(responseBody, &accessTokenResponse); err != nil {
+	var userResponse UserResponse
+	if err := json.Unmarshal(responseBody, &userResponse); err != nil {
 		return nil, err
 	}
-	return &accessTokenResponse, nil
+	if userResponse.Username == "" {
+		return nil, ErrInvalidToken
+	}
+	return &userResponse, nil
 }
 
-func GetCachedAccessToken(c *bicache.Bicache, tokenURL, username, password string) ([]byte, error) {
-	hp := blake2b.Sum256([]byte(password))
-	v := c.Get(username)
+// GetCachedTokenUser is like GetTokenUser but caches the result for an hour.
+// NB the cache is keyed by the access token hash, so the access token itself is never stored.
+func GetCachedTokenUser(c *bicache.Bicache, gitLabUserURL, accessToken string) (string, error) {
+	h := blake2b.Sum256([]byte(accessToken))
+	k := hex.EncodeToString(h[:])
+	v := c.Get(k)
 	if v != nil {
-		if !bytes.HasPrefix(v.([]byte), hp[:]) {
-			return nil, fmt.Errorf("invalid password")
-		}
-		log.Printf("Cache-Hit getting access token for username %s", username)
-		return v.([]byte)[len(hp):], nil
-	} else {
-		log.Printf("Cache-Miss getting access token for username %s", username)
-		response, err := GetAccessToken(tokenURL, username, password)
-		if err != nil {
-			return nil, err
-		}
-		if response.TokenType != "Bearer" {
-			return nil, fmt.Errorf("unknown access token type: %s", response.TokenType)
-		}
-		t := []byte(response.AccessToken)
-		v := append(hp[:], t...)
-		c.SetTTL(username, v, 3600)
-		return v[len(hp):], nil
+		log.Printf("Cache-Hit validating the access token of the %s user", v.(string))
+		return v.(string), nil
 	}
+	log.Print("Cache-Miss validating an access token")
+	userResponse, err := GetTokenUser(gitLabUserURL, accessToken)
+	if err != nil {
+		return "", err
+	}
+	c.SetTTL(k, userResponse.Username, 3600)
+	return userResponse.Username, nil
+}
+
+// dumpRequest dumps the request headers with the credentials redacted.
+func dumpRequest(r *http.Request) string {
+	c := r.Clone(r.Context())
+	if c.Header.Get("Authorization") != "" {
+		c.Header.Set("Authorization", "REDACTED")
+	}
+	dump, _ := httputil.DumpRequest(c, false)
+	return string(dump)
+}
+
+func requestAuthentication(w http.ResponseWriter) {
+	w.Header().Set("WWW-Authenticate", `Basic realm="GitLab"`)
+	w.Header().Set("Cache-Control", `no-cache`)
+	http.Error(w, "HTTP Basic: Access denied", http.StatusUnauthorized)
 }
 
 var (
@@ -100,6 +117,7 @@ var (
 	listenAddressFlag      = flag.String("listen-address", "127.0.0.1:7000", "HOSTNAME:PORT where this http proxy listens at (e.g. 127.0.0.1:7000)")
 	baseGitLabURLFlag      = flag.String("gitlab-base-url", "", "GitLab Base URL (e.g. https://gitlab.example.com/)")
 	insecureSkipVerifyFlag = flag.Bool("tls-insecure-skip-verify", false, "Skip GitLab TLS verification")
+	validateTokenFlag      = flag.Bool("validate-token", true, "Validate the given access token before proxying the request")
 )
 
 func main() {
@@ -134,38 +152,34 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	gitLabTokenURL := gitLabBaseURL.String() + "/oauth/token"
+	gitLabUserURL := gitLabBaseURL.String() + "/api/v4/user"
 
 	reverseProxy := httputil.NewSingleHostReverseProxy(gitLabBaseURL)
 	defaultReverseProxyDirector := reverseProxy.Director
 	reverseProxy.Director = func(r *http.Request) {
 		defaultReverseProxyDirector(r)
-		r.Header.Set("User-Agent", "gitlab-source-link-proxy") // TODO use this user-agent in all this application http requests.
-		username, password, ok := r.BasicAuth()
-		if !ok {
-			log.Print("There is not basic auth in request")
-			r.Header.Set("Authorization", "")
-			return
-		}
-		accessToken, err := GetCachedAccessToken(c, gitLabTokenURL, username, password)
-		if err != nil {
-			log.Printf("Error getting the access token: %v", err)
-			r.Header.Set("Authorization", "")
-		} else {
-			r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
-		}
+		r.Header.Set("User-Agent", userAgent)
 	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		dump, _ := httputil.DumpRequest(r, false)
-		log.Printf("%q", dump)
-		auth := r.Header.Get("Authorization")
-		if auth == "" {
-			log.Printf("request not authenticated, requesting authentication")
-			w.Header().Set("WWW-Authenticate", `Basic realm="GitLab"`)
-			w.Header().Set("Cache-Control", `no-cache`)
-			http.Error(w, "HTTP Basic: Access denied", 401)
+		log.Printf("%q", dumpRequest(r))
+		// NB the basic authentication password must be a GitLab access token
+		//    (e.g. a personal access token); the username is ignored.
+		username, accessToken, ok := r.BasicAuth()
+		if !ok || accessToken == "" {
+			log.Print("request not authenticated, requesting authentication")
+			requestAuthentication(w)
 			return
 		}
+		if *validateTokenFlag {
+			tokenUsername, err := GetCachedTokenUser(c, gitLabUserURL, accessToken)
+			if err != nil {
+				log.Printf("Error validating the access token given as the password of the %q user: %v", username, err)
+				requestAuthentication(w)
+				return
+			}
+			log.Printf("Authenticated as the %s user", tokenUsername)
+		}
+		r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", accessToken))
 		reverseProxy.ServeHTTP(w, r)
 	})
 	log.Fatal(http.ListenAndServe(*listenAddressFlag, nil))

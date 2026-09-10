@@ -1,5 +1,34 @@
 Basic Authorization support for GitLab Source Link requests.
 
+The Visual Studio Source Link requests are authenticated with HTTP Basic
+authentication, which GitLab does not accept in its raw file endpoints. This
+proxy accepts those Basic authentication requests and converts them into the
+`Authorization: Bearer` header that GitLab does accept.
+
+# Authentication
+
+**NB GitLab 19.0 removed the OAuth 2.0 Resource Owner Password Credentials
+flow (`grant_type=password`), which this proxy used to exchange the Basic
+authentication username and password for an access token. That flow cannot be
+re-enabled; GitLab only supports the `authorization_code`, `client_credentials`
+and `device_code` grants. See the [GitLab OAuth 2.0 documentation](https://docs.gitlab.com/api/oauth2/).**
+
+Because of that, the Basic authentication **password must now be a GitLab
+access token**, for example a [personal access token](https://docs.gitlab.com/user/profile/personal_access_tokens/)
+with the `read_api` scope (add `read_repository` too when your GitLab requires
+it to read the repository files). The username is ignored, so you can use
+anything, e.g. `oauth2`.
+
+Each developer must create their own personal access token and enter it as the
+password when Git Credential Manager (or Visual Studio) asks for the GitLab
+credentials.
+
+By default the proxy validates the given access token with the GitLab
+`/api/v4/user` endpoint before proxying the request (the result is cached for
+an hour), and replies with `401 Unauthorized` when the token is invalid, which
+makes the client ask for the credentials again. You can disable that with
+`--validate-token=false`.
+
 You can see this used at [rgl/gitlab-vagrant](https://github.com/rgl/gitlab-vagrant).
 
 # GitLab configuration
@@ -30,7 +59,8 @@ Manually run it:
 Try it:
 
 ```bash
-http --verify=no -v https://root:password@gitlab.example.com/example/ubuntu-vagrant/raw/master/.gitignore User-Agent:SourceLink
+# NB the password must be a GitLab access token; the username is ignored.
+http --verify=no -v https://oauth2:glpat-YOUR-TOKEN@gitlab.example.com/example/ubuntu-vagrant/raw/master/.gitignore User-Agent:SourceLink
 ```
 
 Install it as a systemd service:
